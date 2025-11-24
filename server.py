@@ -5,10 +5,10 @@ from assistant import AIAssistant
 
 app = FastAPI()
 
-# ⭐ Allow your frontend (HTML/JS) to call this API
+# Allow your frontend to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # you can restrict to ["http://127.0.0.1:5500"] later
+    allow_origins=["*"],  # later you can restrict e.g. ["https://your-frontend.com"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -37,5 +37,4 @@ async def chat(request: Request):
             "sources": result["sources"],
         }
     except Exception as e:
-        # for debugging – you can log more details here
         return {"reply": f"Error: {str(e)}"}
