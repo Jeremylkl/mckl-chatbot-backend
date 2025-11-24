@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: mckl-chatbot-backend
+    env: python
+    plan: free
+
+    buildCommand: "bash build.sh"
+    startCommand: "bash start.sh"
+
+    # Optional but nice, sets your Python version
+    runtime: "python"
+    pythonVersion: "3.12"
