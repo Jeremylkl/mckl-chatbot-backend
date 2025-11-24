@@ -4,94 +4,77 @@ from typing import List
 
 from dotenv import load_dotenv
 
-import pandas as pd
 from PyPDF2 import PdfReader
 import docx
-from pdf2image import convert_from_path
-import pytesseract
 
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores.faiss import FAISS
+from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
 load_dotenv()
 
-DATA_DIR = Path("data")
-INDEX_DIR = Path("faiss_index")
+DATA_DIR = Path("data")          # put your PDFs / DOCX / TXT files here
+INDEX_DIR = Path("chroma_db")    # Chroma will persist its DB here
 
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 150))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+
+
+# ------------ Load raw text from files ------------
+
+def load_pdf(path: Path) -> str:
+    reader = PdfReader(str(path))
+    texts = []
+    for page in reader.pages:
+        texts.append(page.extract_text() or "")
+    return "\n".join(texts)
+
+
+def load_docx(path: Path) -> str:
+    doc = docx.Document(str(path))
+    return "\n".join(p.text for p in doc.paragraphs)
 
 
 def load_txt(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
-def load_pdf(path: Path) -> str:
-    txt_pages = []
-    reader = PdfReader(str(path))
-    for page in reader.pages:
-        txt_pages.append(page.extract_text() or "")
-    text = "\n".join(txt_pages)
-    if not text.strip():
-        text = load_pdf_with_ocr(str(path))
-    return text
-
-
-def load_pdf_with_ocr(file_path: str) -> str:
-    try:
-        pages = convert_from_path(file_path)
-        text = ""
-        for page in pages:
-            text += pytesseract.image_to_string(page)
-        return text
-    except Exception as e:
-        print(f"⚠️ OCR failed for {file_path}: {e}")
-        return ""
-
-
-def load_docx(path: Path) -> str:
-    doc = docx.Document(str(path))
-    paragraphs = [p.text for p in doc.paragraphs]
-    return "\n".join(paragraphs)
-
-
-def load_documents_from_folder(folder: Path) -> List[Document]:
+def load_documents() -> List[Document]:
     docs: List[Document] = []
-    for path in sorted(folder.glob("*")):
-        if path.is_dir():
+
+    for path in DATA_DIR.glob("**/*"):
+        if not path.is_file():
             continue
 
         suffix = path.suffix.lower()
-        try:
-            if suffix == ".txt":
-                text = load_txt(path)
-            elif suffix == ".pdf":
-                text = load_pdf(path)
-            elif suffix in [".docx", ".doc"]:
-                text = load_docx(path)
-            elif suffix == ".csv":
-                df = pd.read_csv(path)
-                text = df.to_string(index=False)
-            else:
-                print(f"Skipping unsupported file type: {path.name}")
-                continue
 
-            if not text.strip():
-                print(f"Warning: empty content for {path.name}")
-                continue
+        if suffix == ".pdf":
+            text = load_pdf(path)
+        elif suffix in {".docx", ".doc"}:
+            text = load_docx(path)
+        elif suffix in {".txt", ".md"}:
+            text = load_txt(path)
+        else:
+            # skip unsupported files
+            continue
 
-            meta = {"source": str(path)}
-            docs.append(Document(page_content=text, metadata=meta))
-            print(f"Loaded {path.name}")
-        except Exception as e:
-            print(f"Error loading {path.name}: {e}")
+        if not text.strip():
+            continue
+
+        docs.append(
+            Document(
+                page_content=text,
+                metadata={"source": str(path.relative_to(DATA_DIR))},
+            )
+        )
 
     return docs
 
 
-def chunk_documents(docs: List[Document]):
+# ------------ Chunking ------------
+
+def chunk_documents(docs: List[Document]) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -99,32 +82,36 @@ def chunk_documents(docs: List[Document]):
     return splitter.split_documents(docs)
 
 
-def create_and_save_vectorstore(docs: List[Document], index_dir: Path):
+# ------------ Build & persist Chroma DB ------------
+
+def create_vectorstore(chunks: List[Document]) -> None:
     embeddings = OpenAIEmbeddings()
-    db = FAISS.from_documents(docs, embeddings)
-    index_dir.mkdir(parents=True, exist_ok=True)
-    db.save_local(str(index_dir))
-    print(f"✅ Saved FAISS index to {index_dir}")
+
+    INDEX_DIR.mkdir(exist_ok=True)
+
+    db = Chroma.from_documents(
+        documents=chunks,
+        embedding_function=embeddings,
+        persist_directory=str(INDEX_DIR),
+    )
+    db.persist()
 
 
-def main():
-    if not DATA_DIR.exists():
-        print("❗ Create a 'data/' folder and drop pdf/docx/txt/csv notes there.")
-        return
+def main() -> None:
+    print(f"📁 Looking for documents in: {DATA_DIR.resolve()}")
 
-    print("📥 Loading docs...")
-    docs = load_documents_from_folder(DATA_DIR)
+    docs = load_documents()
     if not docs:
-        print("❗ No documents found in data/. Put files there and try again.")
+        print("⚠️  No documents found in 'data/'. Put PDFs / DOCX / TXT there and run again.")
         return
 
-    print("✂️ Chunking docs...")
+    print(f"✅ Loaded {len(docs)} documents. Chunking...")
     chunks = chunk_documents(docs)
-    print(f"Total chunks: {len(chunks)}")
+    print(f"🔹 Total chunks: {len(chunks)}")
 
-    print("🧠 Creating vector store...")
-    create_and_save_vectorstore(chunks, INDEX_DIR)
-    print("✅ Ingestion complete.")
+    print("📦 Building Chroma index...")
+    create_vectorstore(chunks)
+    print(f"✅ Ingestion complete. Index stored in {INDEX_DIR.resolve()}")
 
 
 if __name__ == "__main__":
