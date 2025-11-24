@@ -1,17 +1,21 @@
 import os
 from pathlib import Path
+from typing import List, Dict
 
 from dotenv import load_dotenv
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores.faiss import FAISS
+from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.schema import Document
-
+from langchain.chains import RetrievalQA
 
 load_dotenv()
 
-INDEX_DIR = Path("faiss_index")
+# Folder where the vector store will live
+INDEX_DIR = Path("chroma_db")
+
+# Model + temperature from env, with safe defaults
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.1"))
 
@@ -22,19 +26,18 @@ class AIAssistant:
         index_dir: Path = INDEX_DIR,
         model_name: str = OPENAI_MODEL,
         temperature: float = TEMPERATURE,
-    ):
+    ) -> None:
         if not index_dir.exists():
             raise RuntimeError(
-                "FAISS index not found. Run ingest.py first to build the index."
+                "Chroma index not found. Run ingest.py first to build the index."
             )
 
+        # Embeddings + Chroma vector store
         embeddings = OpenAIEmbeddings()
 
-        # ⚠️ For LangChain 0.3+ need allow_dangerous_deserialization=True
-        self.db = FAISS.load_local(
-            str(index_dir),
-            embeddings,
-            allow_dangerous_deserialization=True,
+        self.db = Chroma(
+            persist_directory=str(index_dir),
+            embedding_function=embeddings,
         )
 
         self.retriever = self.db.as_retriever(
@@ -42,11 +45,13 @@ class AIAssistant:
             search_kwargs={"k": 6},
         )
 
+        # Chat model
         self.llm = ChatOpenAI(
             model=model_name,
             temperature=temperature,
         )
 
+        # QA chain that returns sources
         self.qa_chain = RetrievalQA.from_chain_type(
             llm=self.llm,
             chain_type="stuff",
@@ -54,26 +59,24 @@ class AIAssistant:
             return_source_documents=True,
         )
 
-        self.chat_history = []
+    def query(self, question: str) -> Dict:
+        """Run a query against the vector store + LLM."""
+        result = self.qa_chain({"query": question})
+        answer: str = result["result"]
+        sources: List[Document] = result.get("source_documents", [])
 
-    def ask(self, query: str) -> dict:
-        """
-        Returns dict with 'answer' (str) and 'sources' (list of file paths).
-        """
-        result = self.qa_chain({"query": query})
-        answer = result["result"]
-        docs = result.get("source_documents", []) or []
-        sources = [d.metadata.get("source", "unknown") for d in docs]
+        source_strings: List[str] = []
+        for i, doc in enumerate(sources, start=1):
+            meta = doc.metadata or {}
+            label = (
+                meta.get("source")
+                or meta.get("file_path")
+                or meta.get("filename")
+                or f"Document {i}"
+            )
+            source_strings.append(f"{i}. {label}")
 
-        # store simple history (optional)
-        self.chat_history.append({"role": "user", "content": query})
-        self.chat_history.append({"role": "assistant", "content": answer})
-
-        return {"answer": answer, "sources": sources}
-
-    def show_history(self) -> str:
-        out = []
-        for turn in self.chat_history:
-            role = "You" if turn["role"] == "user" else "Assistant"
-            out.append(f"{role}: {turn['content']}")
-        return "\n".join(out)
+        return {
+            "answer": answer,
+            "sources": source_strings,
+        }
